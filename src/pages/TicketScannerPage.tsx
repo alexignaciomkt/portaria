@@ -38,8 +38,10 @@ import { formatInTimeZone } from 'date-fns-tz';
 import { useAuth } from '@/contexts/AuthContext';
 import { audioFeedback } from '@/utils/audioFeedback';
 import { computeSemaphorDecision } from '@/utils/semaphorUtils';
+import { parseUniversalQrCode, getSafeQrDiagnosis } from '@/utils/qrCodeParser';
 
 export default function TicketScannerPage() {
+    const isTransactionalWritesEnabled = import.meta.env.VITE_ENABLE_TRANSACTIONAL_WRITES === 'true';
     const { session, loading: authLoading, isAuthenticated } = useAuth();
     const { slug } = useParams<{ slug: string }>();
     const navigate = useNavigate();
@@ -419,20 +421,26 @@ export default function TicketScannerPage() {
         setCurrentQrCode(qrData);
         setPhotoStatus('loading');
 
-        const cleanQr = qrData.trim();
+        // Classificação e extração canônica (suporta tokens diretos e URLs de domínios A2)
+        const parsed = parseUniversalQrCode(qrData);
+        const safeDiag = getSafeQrDiagnosis(parsed);
+        console.log('[SCANNER DIAGNÓSTICO SEGURO]', safeDiag);
+
+        const canonicalCode = parsed.canonicalCode || qrData.trim();
+        setCurrentQrCode(canonicalCode);
 
         try {
-            if (cleanQr.startsWith('TKT_')) {
+            if (parsed.type === 'TICKET') {
                 // ROTA A: INGRESSO DE PÚBLICO
-                await handleTicketValidation(cleanQr, abortController.signal);
-            } else if (cleanQr.startsWith('CRED-')) {
+                await handleTicketValidation(canonicalCode, abortController.signal);
+            } else if (parsed.type === 'STAFF_CREDENTIAL') {
                 // ROTA B: CREDENCIAL PROFISSIONAL DE STAFF
-                await handleStaffValidation(cleanQr, abortController.signal);
+                await handleStaffValidation(canonicalCode, abortController.signal);
             } else {
-                // ROTA C: PREFIXO DESCONHECIDO (Rejeição Segura e Informativa)
+                // ROTA C: PREFIXO DESCONHECIDO OU URL NÃO AUTORIZADA
                 setResult({
                     code: 'INVALID_QR',
-                    message: 'Código não reconhecido. Ingressos de público iniciam com TKT_ e credenciais profissionais com CRED-.'
+                    message: parsed.errorReason || 'Código não reconhecido. Ingressos de público iniciam com TKT_ e credenciais profissionais com CRED-.'
                 });
                 setManualInput('');
             }
@@ -514,6 +522,30 @@ export default function TicketScannerPage() {
                     description: "Este profissional possui escala em uma data futura. A entrada antecipada somente pode ser autorizada no dia da escala.",
                     variant: "destructive"
                 });
+            } else if (res.state === 'NO_CONFIRMED_SHIFTS') {
+                toast({
+                    title: "Sem Escala Confirmada",
+                    description: "Profissional cadastrado, porém sem escalas ou turnos confirmados para este evento.",
+                    variant: "destructive"
+                });
+            } else if (res.state === 'CREDENTIAL_NOT_FOUND') {
+                toast({
+                    title: "Credencial Não Encontrada",
+                    description: "Código não encontrado na base de credenciais deste evento.",
+                    variant: "destructive"
+                });
+            } else if (res.state === 'UNAUTHORIZED_OPERATOR') {
+                toast({
+                    title: "Acesso Não Autorizado",
+                    description: res.message || "Você não possui permissão para autorizar presença neste evento.",
+                    variant: "destructive"
+                });
+            } else if (res.state === 'API_ERROR') {
+                toast({
+                    title: "Falha no Serviço",
+                    description: "O serviço de validação retornou um erro interno temporário.",
+                    variant: "destructive"
+                });
             } else if (res.success && res.state === 'AWAITING_CHECKIN' && res.isEarly) {
                 toast({ 
                     title: "Escala de Hoje (Antecipada)", 
@@ -585,7 +617,7 @@ export default function TicketScannerPage() {
         if (photoStatus !== 'loaded') {
             toast({
                 title: "Identidade Não Verificada",
-                description: "Fotografia indisponível. A confirmação de presença exige fotografia válida carregada no dispositivo.",
+                description: "Fotografia indisponível. A conferência de presença exige fotografia válida carregada no dispositivo.",
                 variant: "destructive"
             });
             return;
@@ -595,6 +627,16 @@ export default function TicketScannerPage() {
             toast({
                 title: "Escala em Data Futura",
                 description: "Este profissional possui escala em uma data futura. A entrada antecipada somente pode ser autorizada no dia da escala.",
+                variant: "destructive"
+            });
+            return;
+        }
+
+        // BLOQUEIO ESTRITO DE ESCRITA EM HOMOLOGAÇÃO
+        if (!isTransactionalWritesEnabled) {
+            toast({
+                title: "MODO HOMOLOGAÇÃO — REGISTRO DESATIVADO",
+                description: "A leitura de QR, foto e turnos foram homologados com sucesso. Ações que gravam presença física no banco estão desativadas.",
                 variant: "destructive"
             });
             return;
@@ -634,10 +676,10 @@ export default function TicketScannerPage() {
             }) : null);
         } catch (err: any) {
             const msg = err.message || 'Falha ao confirmar presença';
-            if (msg.includes('HOMOLOGATION_READ_ONLY')) {
+            if (msg.includes('MODO HOMOLOGAÇÃO') || err.code === 'HOMOLOGATION_WRITE_BLOCKED') {
                 toast({ 
-                    title: "Ambiente Seguro (SCAN-ONLY)", 
-                    description: "Leitura e identificação aprovadas com sucesso. A gravação no banco compartilhado está bloqueada para proteger os dados de produção.",
+                    title: "MODO HOMOLOGAÇÃO — REGISTRO DESATIVADO", 
+                    description: "Leitura e identificação aprovadas. A gravação no banco de produção está bloqueada neste ambiente.",
                     variant: "destructive"
                 });
             } else if (msg.includes('EARLY_AUTHORIZATION_FORBIDDEN')) {
@@ -657,6 +699,17 @@ export default function TicketScannerPage() {
     const handleConfirmStaffCheckout = async () => {
         const target = effectiveStaffResult || staffResult;
         if (!target?.credentialId || !eventId) return;
+
+        // BLOQUEIO ESTRITO DE ESCRITA EM HOMOLOGAÇÃO
+        if (!isTransactionalWritesEnabled) {
+            toast({
+                title: "MODO HOMOLOGAÇÃO — REGISTRO DESATIVADO",
+                description: "A leitura de QR, foto e turnos foram homologados com sucesso. O encerramento de turno no banco está desativado.",
+                variant: "destructive"
+            });
+            return;
+        }
+
         setConfirmingAttendance(true);
         try {
             const res = await staffAttendanceService.checkoutAttendance({
@@ -687,10 +740,10 @@ export default function TicketScannerPage() {
             }) : null);
         } catch (err: any) {
             const msg = err.message || 'Falha ao registrar saída';
-            if (msg.includes('HOMOLOGATION_READ_ONLY')) {
+            if (msg.includes('MODO HOMOLOGAÇÃO') || err.code === 'HOMOLOGATION_WRITE_BLOCKED') {
                 toast({ 
-                    title: "Ambiente Seguro (SCAN-ONLY)", 
-                    description: "Leitura aprovada. O registro de saída no banco compartilhado está bloqueado em modo de homologação.",
+                    title: "MODO HOMOLOGAÇÃO — REGISTRO DESATIVADO", 
+                    description: "Leitura aprovada. O registro de saída no banco está bloqueado em modo de homologação.",
                     variant: "destructive"
                 });
             } else {
@@ -1160,6 +1213,13 @@ export default function TicketScannerPage() {
 
                                     {/* D. AÇÕES OPERACIONAIS CONTEXTUAIS */}
                                     <div className="w-full max-w-sm space-y-2 pt-1">
+                                        {!isTransactionalWritesEnabled && (
+                                            <div className="w-full text-center py-2 px-3 bg-amber-500/15 border border-amber-500/40 rounded-xl text-xs font-bold text-amber-600 dark:text-amber-400 flex items-center justify-center gap-2">
+                                                <Lock className="w-4 h-4 text-amber-500 shrink-0" />
+                                                <span>MODO HOMOLOGAÇÃO — REGISTRO DESATIVADO</span>
+                                            </div>
+                                        )}
+
                                         {/* Botão de Autorização Antecipada (Mesmo dia) */}
                                         {effectiveStaffResult?.isEarly && !effectiveStaffResult?.isFutureDate && (
                                             <Button

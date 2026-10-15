@@ -39,6 +39,21 @@ export interface StaffShiftItem {
     checkedOutAt?: string;
 }
 
+export type StaffCredentialState =
+    | 'AWAITING_CHECKIN'
+    | 'IN_SERVICE'
+    | 'CHECKED_OUT'
+    | 'SHIFT_NOT_STARTED'
+    | 'SHIFT_EXPIRED'
+    | 'INVALID_CREDENTIAL'
+    | 'WRONG_EVENT'
+    | 'UNAUTHORIZED_OPERATOR'
+    | 'NO_CONFIRMED_SHIFTS'
+    | 'CREDENTIAL_NOT_FOUND'
+    | 'API_ERROR'
+    | 'NETWORK_ERROR'
+    | 'TIMEOUT_EXCEEDED';
+
 export interface StaffValidationResponse {
     success: boolean;
     type?: 'STAFF' | 'EMPLOYEE';
@@ -46,7 +61,7 @@ export interface StaffValidationResponse {
     person?: StaffPerson;
     shifts?: StaffShiftItem[];
     suggestedShiftId?: string | null;
-    state: 'AWAITING_CHECKIN' | 'IN_SERVICE' | 'CHECKED_OUT' | 'SHIFT_NOT_STARTED' | 'SHIFT_EXPIRED' | 'INVALID_CREDENTIAL' | 'WRONG_EVENT' | 'UNAUTHORIZED_OPERATOR';
+    state: StaffCredentialState;
     stateLabel: string;
     canCheckIn: boolean;
     canCheckOut: boolean;
@@ -101,17 +116,43 @@ export const staffAttendanceService = {
 
             const data = await response.json().catch(() => ({}));
             if (!response.ok) {
+                let state: any = 'INVALID_CREDENTIAL';
+                let message = data.message || data.error || 'Credencial não autorizada';
+
+                if (response.status === 404) {
+                    state = 'CREDENTIAL_NOT_FOUND';
+                    message = 'Esta credencial não foi localizada na base de dados deste evento.';
+                } else if (response.status === 403) {
+                    state = 'UNAUTHORIZED_OPERATOR';
+                    message = data.message || 'Você não possui permissão para autorizar ou registrar presença neste evento.';
+                } else if (response.status >= 500) {
+                    state = 'API_ERROR';
+                    message = 'O serviço de validação retornou um erro interno temporário. Tente novamente em instantes.';
+                }
+
                 return {
                     ...data,
                     success: false,
-                    state: data.state || 'INVALID_CREDENTIAL',
+                    state,
                     stateLabel: data.stateLabel || 'Não Autorizado',
                     canCheckIn: false,
                     canCheckOut: false,
-                    error: data.error || 'Erro ao validar credencial',
-                    message: data.message || data.error || 'Credencial não autorizada',
+                    error: data.error || state,
+                    message,
                     person: data.person || undefined,
                     shifts: data.shifts || undefined
+                };
+            }
+
+            // Se a validação foi bem sucedida mas não possui turnos cadastrados
+            if (data.success && (!data.shifts || data.shifts.length === 0)) {
+                return {
+                    ...data,
+                    state: 'NO_CONFIRMED_SHIFTS',
+                    stateLabel: 'Sem Escala',
+                    canCheckIn: false,
+                    canCheckOut: false,
+                    message: 'Profissional identificado, porém não possui escalas ou turnos confirmados para este evento.'
                 };
             }
 
@@ -120,21 +161,22 @@ export const staffAttendanceService = {
             const isTimeout = err?.name === 'TimeoutError' || err?.message?.includes('Tempo limite');
             return {
                 success: false,
-                state: 'INVALID_CREDENTIAL',
+                state: isTimeout ? 'TIMEOUT_EXCEEDED' : 'NETWORK_ERROR',
                 stateLabel: isTimeout ? 'Tempo Esgotado' : 'Erro de Conexão',
                 canCheckIn: false,
                 canCheckOut: false,
                 error: isTimeout ? 'TIMEOUT_EXCEEDED' : 'NETWORK_ERROR',
                 message: isTimeout 
                     ? 'Tempo limite de conexão esgotado (10s). O servidor não respondeu a tempo.'
-                    : (err.message || 'Erro ao consultar credencial de equipe.')
+                    : (err.message || 'Erro de rede ao consultar credencial. Verifique sua conexão com a internet.')
             };
         }
     },
 
     /**
      * Confirma a entrada (presença física) de um profissional.
-     * Suporta autorização antecipada explícita solicitada pelo produtor proprietário.
+     * PROTEÇÃO DE PRODUÇÃO: Em ambiente de homologação (P1.x), mutações no banco
+     * compartilhado de produção são estritamente interceptadas e simuladas localmente.
      */
     confirmAttendance: async (params: {
         credentialId: string;
@@ -146,6 +188,17 @@ export const staffAttendanceService = {
         earlyAuthorization?: boolean;
         earlyReason?: string;
     }, options: { timeout?: number; signal?: AbortSignal } = {}): Promise<{ success: boolean; message: string; checkedInAt?: string; earlyMinutes?: number; delayMinutes?: number; shiftId?: string; correlationId?: string }> => {
+        // Blindagem de Produção: Impede estritamente gravações de homologação no banco de produção
+        const isHomologationProtectionActive = import.meta.env.VITE_ENABLE_TRANSACTIONAL_WRITES !== 'true';
+
+        if (isHomologationProtectionActive) {
+            console.warn('🛡️ [MODO HOMOLOGAÇÃO] Registro desativado: Tentativa de check-in bloqueada para proteção do banco de produção.');
+            const error: any = new Error('MODO HOMOLOGAÇÃO — REGISTRO DESATIVADO');
+            error.code = 'HOMOLOGATION_WRITE_BLOCKED';
+            error.description = 'Ações que gravam no banco de dados estão desativadas neste ambiente de homologação.';
+            throw error;
+        }
+
         const response = await authenticatedFetch(`${API_BASE_URL}/api/credentials/confirm`, {
             method: 'POST',
             headers: {
@@ -165,15 +218,26 @@ export const staffAttendanceService = {
     },
 
     /**
-     * Registra a saída do profissional (checkout), revogando seu acesso operacional à Portaria
+     * Registra o encerramento de turno (checkout) de um profissional.
+     * PROTEÇÃO DE PRODUÇÃO: Em homologação (P1.x), mutações são estritamente bloqueadas.
      */
     checkoutAttendance: async (params: {
         credentialId: string;
         eventId: string;
+        shiftId?: string;
         eventStaffId?: string;
         employeeId?: string;
-        shiftId?: string;
-    }, options: { timeout?: number; signal?: AbortSignal } = {}): Promise<{ success: boolean; message: string; checkedOutAt?: string; shiftId?: string; correlationId?: string }> => {
+    }, options: { timeout?: number; signal?: AbortSignal } = {}): Promise<{ success: boolean; message: string; checkedOutAt?: string }> => {
+        const isHomologationProtectionActive = import.meta.env.VITE_ENABLE_TRANSACTIONAL_WRITES !== 'true';
+
+        if (isHomologationProtectionActive) {
+            console.warn('🛡️ [MODO HOMOLOGAÇÃO] Registro desativado: Tentativa de checkout bloqueada para proteção do banco de produção.');
+            const error: any = new Error('MODO HOMOLOGAÇÃO — REGISTRO DESATIVADO');
+            error.code = 'HOMOLOGATION_WRITE_BLOCKED';
+            error.description = 'Ações que gravam no banco de dados estão desativadas neste ambiente de homologação.';
+            throw error;
+        }
+
         const response = await authenticatedFetch(`${API_BASE_URL}/api/credentials/checkout`, {
             method: 'POST',
             headers: {

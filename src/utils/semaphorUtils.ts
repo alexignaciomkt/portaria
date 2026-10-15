@@ -41,8 +41,8 @@ export function computeSemaphorDecision(params: {
     staffResult?: StaffValidationResponse | null;
     scanError?: { title: string; message: string; isTimeout?: boolean } | null;
     photoStatus?: 'loading' | 'loaded' | 'error' | 'missing';
-}): SemaphorDecision {
-    const { result, staffResult, scanError, photoStatus = 'loaded' } = params;
+} = {}): SemaphorDecision {
+    const { result, staffResult, scanError, photoStatus = 'loaded' } = params || {};
 
     // 1. ESTADO NEUTRO — FALHA TÉCNICA / TIMEOUT / INDETERMINADO
     if (scanError) {
@@ -196,6 +196,87 @@ export function computeSemaphorDecision(params: {
                     iconBg: 'bg-destructive text-white',
                     photoRing: 'ring-destructive/40 border-destructive',
                     actionButtonClass: 'bg-zinc-800 hover:bg-zinc-700 text-white'
+                },
+                actionType: 'NEW_SCAN',
+                isStaff: true,
+                isTicket: false
+            };
+        }
+
+        // A.1 Sem escalas confirmadas para este evento -> VERMELHO informativo
+        if (staffResult.state === 'NO_CONFIRMED_SHIFTS') {
+            return {
+                level: 'red',
+                title: 'SEM ESCALA CONFIRMADA',
+                subtitle: staffResult.message || 'Profissional identificado, porém não possui escalas ou turnos de trabalho confirmados para este evento.',
+                badgeLabel: 'SEM TURNO VINCULADO',
+                sound: 'red',
+                theme: {
+                    bannerBg: 'bg-destructive/15 border-destructive/50',
+                    bannerBorder: 'border-destructive/60',
+                    bannerText: 'text-destructive',
+                    badgeBg: 'bg-destructive',
+                    badgeText: 'text-white font-black',
+                    borderColor: 'border-destructive/60',
+                    iconBg: 'bg-destructive text-white',
+                    photoRing: 'ring-destructive/40 border-destructive',
+                    actionButtonClass: 'bg-zinc-800 hover:bg-zinc-700 text-white'
+                },
+                actionType: 'NEW_SCAN',
+                isStaff: true,
+                isTicket: false
+            };
+        }
+
+        // A.2 Credencial inexistente no banco de dados (404) -> VERMELHO
+        if (staffResult.state === 'CREDENTIAL_NOT_FOUND') {
+            return {
+                level: 'red',
+                title: 'CREDENCIAL NÃO ENCONTRADA',
+                subtitle: staffResult.message || 'Esta credencial não foi localizada na base de dados deste evento.',
+                badgeLabel: 'CREDENCIAL INEXISTENTE',
+                sound: 'red',
+                theme: {
+                    bannerBg: 'bg-destructive/15 border-destructive/50',
+                    bannerBorder: 'border-destructive/60',
+                    bannerText: 'text-destructive',
+                    badgeBg: 'bg-destructive',
+                    badgeText: 'text-white font-black',
+                    borderColor: 'border-destructive/60',
+                    iconBg: 'bg-destructive text-white',
+                    photoRing: 'ring-destructive/40 border-destructive',
+                    actionButtonClass: 'bg-zinc-800 hover:bg-zinc-700 text-white'
+                },
+                actionType: 'NEW_SCAN',
+                isStaff: true,
+                isTicket: false
+            };
+        }
+
+        // A.3 Falha de API (500) ou Timeout/Rede -> NEUTRO (INDETERMINADO)
+        if (
+            staffResult.state === 'API_ERROR' || 
+            staffResult.state === 'NETWORK_ERROR' || 
+            staffResult.state === 'TIMEOUT_EXCEEDED' ||
+            staffResult.error === 'NETWORK_ERROR' ||
+            staffResult.error === 'TIMEOUT_EXCEEDED'
+        ) {
+            return {
+                level: 'neutral',
+                title: staffResult.state === 'API_ERROR' ? 'FALHA NO SERVIÇO DE VALIDAÇÃO' : 'FALHA DE CONEXÃO',
+                subtitle: staffResult.message || 'Não foi possível verificar a credencial com segurança. Nenhuma decisão foi tomada.',
+                badgeLabel: 'INDETERMINADO',
+                sound: 'neutral',
+                theme: {
+                    bannerBg: 'bg-zinc-800/80 border-zinc-600',
+                    bannerBorder: 'border-zinc-600',
+                    bannerText: 'text-zinc-200',
+                    badgeBg: 'bg-zinc-700',
+                    badgeText: 'text-zinc-100 font-bold',
+                    borderColor: 'border-zinc-600',
+                    iconBg: 'bg-zinc-700 text-zinc-300',
+                    photoRing: 'ring-zinc-600/40 border-zinc-600',
+                    actionButtonClass: 'bg-zinc-700 hover:bg-zinc-600 text-white'
                 },
                 actionType: 'NEW_SCAN',
                 isStaff: true,
